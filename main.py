@@ -15,7 +15,6 @@ from utils.logger import create_logger
 import time
 import numpy as np
 import random
-from apex import amp
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from datasets.blending import CutmixMixupBlending
 from utils.config import get_config
@@ -38,7 +37,9 @@ def parse_option():
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--accumulation-steps', type=int)
 
-    parser.add_argument("--local_rank", type=int, default=-1, help='local rank for DistributedDataParallel')
+    # torch>=2.0 launchers pass --local-rank (hyphen) or set LOCAL_RANK env
+    parser.add_argument("--local_rank", "--local-rank", dest="local_rank", type=int,
+                        default=int(os.environ.get("LOCAL_RANK", 0)), help='local rank for DistributedDataParallel')
     args = parser.parse_args()
 
     config = get_config(args)
@@ -72,8 +73,9 @@ def main(config):
 
     optimizer = build_optimizer(config, model)
     lr_scheduler = build_scheduler(config, optimizer, len(train_loader))
-    if config.TRAIN.OPT_LEVEL != 'O0':
-        model, optimizer = amp.initialize(models=model, optimizers=optimizer, opt_level=config.TRAIN.OPT_LEVEL)
+    # Apex amp -> torch.cuda.amp (Apex is not available on recent PyTorch/Colab)
+    global scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=config.TRAIN.OPT_LEVEL != 'O0')
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False,
                                                       find_unused_parameters=False)
@@ -111,6 +113,8 @@ def main(config):
             is_best = acc1 > max_accuracy
             max_accuracy = max(max_accuracy, acc1)
             logger.info(f'Max accuracy: {max_accuracy:.2f}%')
+            if epoch == (config.TRAIN.EPOCHS - 1):
+                logger.info(f'Last-epoch accuracy: {acc1:.2f}%')
             if dist.get_rank() == 0 and (
                     epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1) or is_best):
                 epoch_saving(config, epoch, model, max_accuracy, optimizer, lr_scheduler, logger, config.OUTPUT,
@@ -150,25 +154,23 @@ def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler, train_load
         if mixup_fn is not None:
             images, label_id = mixup_fn(images, label_id)
 
-        output = model(images)
-
-        total_loss = criterion(output, label_id)
+        with torch.cuda.amp.autocast(enabled=config.TRAIN.OPT_LEVEL != 'O0'):
+            output = model(images)
+            total_loss = criterion(output, label_id)
         total_loss = total_loss / config.TRAIN.ACCUMULATION_STEPS
 
         if config.TRAIN.ACCUMULATION_STEPS == 1:
             optimizer.zero_grad()
-        if config.TRAIN.OPT_LEVEL != 'O0':
-            with amp.scale_loss(total_loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            total_loss.backward()
+        scaler.scale(total_loss).backward()
         if config.TRAIN.ACCUMULATION_STEPS > 1:
             if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
                 lr_scheduler.step_update(epoch * num_steps + idx)
         else:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
@@ -217,7 +219,8 @@ def validate(val_loader, model, config):
                 if config.TRAIN.OPT_LEVEL == 'O2':
                     image_input = image_input.half()
 
-                output = model(image_input)
+                with torch.cuda.amp.autocast(enabled=config.TRAIN.OPT_LEVEL != 'O0'):
+                    output = model(image_input)
 
                 similarity = output.view(b, -1).softmax(dim=-1)
                 tot_similarity += similarity
