@@ -5,7 +5,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+import os
+import torch.utils.checkpoint
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -246,6 +247,11 @@ class Transformer(nn.Module):
                                          for i in range(layers)])
 
     def forward(self, x: torch.Tensor):
+        # GRAD_CKPT=1: gradient checkpointing (same math, less GPU memory, slower)
+        if self.training and torch.is_grad_enabled() and os.environ.get('GRAD_CKPT', '0') == '1':
+            for blk in self.resblocks:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            return x
         return self.resblocks(x)
 
 
